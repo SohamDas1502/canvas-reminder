@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canvas Reminder Demo</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --ink: #1d2433; --muted: #667085; --line: #e4e7ec;
+    --accent: #2f6fed; --accent-soft: #e8f0fe; --good: #12805c; --good-soft: #e3f5ec;
+    --warn: #b54708; --warn-soft: #fef0e1; --bad: #c0362c; --bad-soft: #fdecea;
+    --phone: #111827; --notif: #ffffff; --gcal: #1a73e8; --todo: #2564cf;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1218; --panel: #171b23; --ink: #e6e9ef; --muted: #98a2b3; --line: #2a303c;
+      --accent: #6d9bff; --accent-soft: #1d2a45; --good: #4cc38a; --good-soft: #15302a;
+      --warn: #f5a35c; --warn-soft: #3a2a17; --bad: #ff7b72; --bad-soft: #3a1d1b;
+      --phone: #05070a; --notif: #222834;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center;
+           padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  .clock { font-weight: 600; background: var(--accent-soft); color: var(--accent);
+           padding: 6px 12px; border-radius: 999px; }
+  .note { color: var(--muted); font-size: 12px; margin-left: auto; }
+  main { display: grid; grid-template-columns: 300px 1fr; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+  .group { margin-bottom: 14px; }
+  .group p { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+  button { display: block; width: 100%; text-align: left; margin: 0 0 6px; padding: 8px 10px;
+           border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink);
+           font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); background: var(--accent-soft); }
+  button.on { border-color: var(--warn); background: var(--warn-soft); }
+  button.reset { color: var(--bad); }
+  .side { display: flex; flex-direction: column; gap: 16px; }
+  .runs { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow: auto; }
+  .runs li { padding: 8px 0; border-top: 1px solid var(--line); }
+  .runs li:first-child { border-top: 0; }
+  .runs .when { font-size: 12px; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); }
+  .chip.good { background: var(--good-soft); color: var(--good); border-color: transparent; }
+  .chip.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+  .chip.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+  .chip.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+  .channels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  @media (max-width: 1000px) { .channels { grid-template-columns: 1fr; } }
+  .leads { display: flex; gap: 6px; }
+  .leads input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); font: inherit; }
+  .leads button { width: auto; margin: 0; }
+  #leads-msg { color: var(--bad); }
+  .flag { flex: 0 0 18px; height: 18px; border: 2px solid #f59e0b; border-radius: 50%; margin-top: 2px; }
+  .content { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .phone { background: var(--phone); border-radius: 22px; padding: 14px 10px; min-height: 360px; max-height: 520px; overflow: auto; }
+  .phone .bar { color: #cbd5e1; text-align: center; font-size: 12px; margin-bottom: 10px; }
+  .notif { background: var(--notif); color: var(--ink); border-radius: 14px; padding: 10px 12px; margin-bottom: 8px;
+           border: 2px solid transparent; }
+  .notif.fresh { border-color: var(--accent); }
+  .notif .app { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+  .notif .t { font-weight: 600; }
+  .notif .b { white-space: pre-line; font-size: 13px; color: var(--muted); }
+  .notif.high .t::after { content: "  •  high priority"; color: var(--warn); font-weight: 400; font-size: 11px; }
+  .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px 8px; }
+  .phone .empty { color: #94a3b8; }
+  .item { display: flex; gap: 10px; padding: 9px 0; border-top: 1px solid var(--line); align-items: flex-start; }
+  .item:first-child { border-top: 0; }
+  .item.deleted { opacity: .45; text-decoration: line-through; }
+  .date { flex: 0 0 44px; text-align: center; border-radius: 8px; background: var(--accent-soft); color: var(--gcal); padding: 4px 0; }
+  .date b { display: block; font-size: 18px; line-height: 1.1; }
+  .date small { font-size: 10px; text-transform: uppercase; }
+  .circle { flex: 0 0 18px; height: 18px; border: 2px solid var(--todo); border-radius: 50%; margin-top: 2px; }
+  .item .main { min-width: 0; flex: 1; }
+  .item .label { font-weight: 600; overflow-wrap: anywhere; }
+  .item .meta { font-size: 12px; color: var(--muted); }
+  .tag { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; margin-left: 6px; vertical-align: 1px; }
+  .tag.created { background: var(--good-soft); color: var(--good); }
+  .tag.updated { background: var(--accent-soft); color: var(--accent); }
+  .tag.deleted { background: var(--bad-soft); color: var(--bad); }
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 7px 8px; border-top: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; border-top: 0; white-space: nowrap; }
+  td code { font-family: var(--mono); font-size: 11px; }
+  .status { font-weight: 600; }
+  .status.active { color: var(--good); }
+  .status.removed { color: var(--bad); }
+  .explain { font-size: 12px; color: var(--muted); margin: -4px 0 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>canvas-reminder-pipeline <span>· local demo</span></h1>
+  <div class="clock" id="clock">…</div>
+  <div class="note">Real pipeline code · fake sample feed · in-memory DynamoDB · nothing is actually sent</div>
+</header>
+
+<main>
+  <aside class="side">
+    <section class="panel">
+      <h2>Scheduler</h2>
+      <div class="group">
+        <p>Each button is one scheduled Lambda run at the simulated time.</p>
+        <button data-action="run">▶ Run now</button>
+        <button data-action="rerun">↻ Run again (retry: must send nothing)</button>
+        <button data-action="advance_30m">⏩ +30 minutes, then run</button>
+        <button data-action="advance_day">⏭ +1 day, then run</button>
+      </div>
+      <div class="group">
+        <p>Jump to Assignment 1's reminder times.</p>
+        <button data-action="jump_2d">⏰ 2 days before due</button>
+        <button data-action="jump_2h">⏰ 2 hours before due</button>
+      </div>
+      <h2>Reminder times</h2>
+      <div class="group">
+        <p>How long before each due date? Same as <code>make configure</code>; applies to every app.</p>
+        <form id="leads-form" class="leads">
+          <input id="leads" value="2d, 2h" aria-label="Lead times" placeholder="e.g. 3d, 1d, 2h">
+          <button type="submit">Apply</button>
+        </form>
+        <p id="leads-msg"></p>
+      </div>
+      <h2>Change Canvas</h2>
+      <div class="group">
+        <p>Edit the fake feed, then run.</p>
+        <button data-action="toggle_due" id="b-due"></button>
+        <button data-action="toggle_add" id="b-add"></button>
+        <button data-action="toggle_remove" id="b-remove"></button>
+        <button data-action="glitch">⚠ Canvas returns an empty feed</button>
+      </div>
+      <button data-action="reset" class="reset">Reset demo</button>
+    </section>
+    <section class="panel">
+      <h2>Run log</h2>
+      <ul class="runs" id="runs"></ul>
+    </section>
+  </aside>
+
+  <div class="content">
+    <div class="channels">
+      <section class="panel">
+        <h2>ntfy · phone</h2>
+        <div class="phone" id="phone"></div>
+      </section>
+      <section class="panel">
+        <h2>Google Calendar</h2>
+        <p class="explain">One event per assignment at its due time, with popup reminders.</p>
+        <div id="gcal"></div>
+      </section>
+      <section class="panel">
+        <h2>Microsoft To Do · "Canvas" list</h2>
+        <p class="explain">One reminder per task, so it moves to the next reminder time as each passes.</p>
+        <div id="todo"></div>
+      </section>
+      <section class="panel">
+        <h2>Apple Reminders · via Shortcut</h2>
+        <p class="explain">What the iPhone Shortcut reads from the feed. Same moving alert as To Do.</p>
+        <div id="apple"></div>
+      </section>
+    </div>
+
+    <section class="panel">
+      <h2>DynamoDB state table</h2>
+      <p class="explain">One item per Canvas UID. <b>sent</b> holds the claim keys that stop duplicate pushes;
+        <b>refs</b> holds each channel's id and the content hash it was synced at.</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Assignment</th><th>Due (Melbourne)</th><th>v</th><th>Status</th><th>hash</th><th>sent (claim keys)</th><th>refs</th></tr></thead>
+        <tbody id="records"></tbody>
+      </table></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const EMOJI = { new: "🆕", calendar: "📅", pencil: "✏️", alarm_clock: "⏰", wastebasket: "🗑️", white_check_mark: "✅" };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function chip(text, cls = "") { return `<span class="chip ${cls}">${esc(text)}</span>`; }
+
+function renderRuns(runs) {
+  if (!runs.length) return `<li class="empty">No runs yet. Press <b>Run now</b>.</li>`;
+  return runs.map((r) => {
+    let chips = "";
+    if (r.error) chips = chip(r.error, "bad");
+    else {
+      const s = r.summary;
+      for (const k of ["new", "changed", "removed", "unchanged"]) if (s[k]) chips += chip(`${k} ${s[k]}`, k === "unchanged" ? "" : "accent");
+      for (const [k, v] of Object.entries(s)) if (k.endsWith("_sent") || k.endsWith("_synced") || k.endsWith("_deleted")) chips += chip(`${k.replace("_", " ")} ${v}`, "good");
+      if (!r.pushes && !Object.keys(s).some((k) => k.endsWith("_synced") || k.endsWith("_deleted"))) chips += chip("nothing to do: no duplicates", "good");
+    }
+    return `<li><div><b>#${r.n}</b> ${esc(r.label)}</div><div class="when">${esc(r.at)}</div><div class="chips">${chips}</div></li>`;
+  }).join("");
+}
+
+function renderPhone(pushes, lastRun) {
+  const bar = `<div class="bar">Notifications</div>`;
+  if (!pushes.length) return bar + `<div class="empty">No notifications yet</div>`;
+  return bar + pushes.map((p) => {
+    const icon = p.tags.map((t) => EMOJI[t] || "").join("");
+    return `<div class="notif ${p.run === lastRun ? "fresh" : ""} ${p.priority >= 4 ? "high" : ""}">
+      <div class="app"><span>ntfy · canvas</span><span>${esc(p.at)}</span></div>
+      <div class="t">${icon} ${esc(p.title)}</div>
+      <div class="b">${esc(p.body)}</div></div>`;
+  }).join("");
+}
+
+function badge(item, lastRun) {
+  if (item.touched_run !== lastRun) return "";
+  if (item.deleted) return `<span class="tag deleted">DELETED</span>`;
+  return item.created_run === lastRun ? `<span class="tag created">CREATED</span>` : `<span class="tag updated">UPDATED</span>`;
+}
+
+function renderGcal(items, lastRun) {
+  if (!items.length) return `<div class="empty">No events</div>`;
+  return items.map((e) => {
+    const [, day, mon] = e.due.split(" ");
+    return `<div class="item ${e.deleted ? "deleted" : ""}">
+      <div class="date"><b>${esc(day)}</b><small>${esc(mon.replace(",", ""))}</small></div>
+      <div class="main"><div class="label">${esc(e.label)}${badge(e, lastRun)}</div>
+      <div class="meta">${esc(e.due)}</div>
+      <div class="meta">🔔 ${e.leads.map(esc).join(" · ")} before${e.updates ? ` · updated ${e.updates}×` : ""}</div></div></div>`;
+  }).join("");
+}
+
+function renderTodo(items, lastRun) {
+  if (!items.length) return `<div class="empty">No tasks</div>`;
+  return items.map((t) => `<div class="item ${t.deleted ? "deleted" : ""}">
+      <div class="circle"></div>
+      <div class="main"><div class="label">${esc(t.label)}${badge(t, lastRun)}</div>
+      <div class="meta">📅 Due ${esc(t.due)}</div>
+      <div class="meta">⏰ Remind me ${esc(t.reminder_at)}</div></div></div>`).join("");
+}
+
+function renderApple(items) {
+  if (!items.length) return `<div class="empty">No reminders</div>`;
+  return items.map((i) => `<div class="item ${i.action === "delete" ? "deleted" : ""}">
+      <div class="flag"></div>
+      <div class="main"><div class="label">${esc(i.title)}</div>
+      <div class="meta">📅 Due ${esc(i.due_text)}</div>
+      <div class="meta">🔔 Alert ${esc(i.alert_text)}</div></div></div>`).join("");
+}
+
+function renderRecords(records) {
+  if (!records.length) return `<tr><td colspan="7" class="empty">Empty. The first run fills it.</td></tr>`;
+  return records.map((r) => `<tr>
+    <td><b>${esc(r.label)}</b><br><code>${esc(r.uid)}</code></td>
+    <td>${esc(r.due)}<br><span class="meta">${esc(r.in)}</span></td>
+    <td>${r.version}</td>
+    <td class="status ${r.status}">${r.status}</td>
+    <td><code>${esc(r.hash)}</code></td>
+    <td><div class="chips">${r.sent.map((k) => chip(k)).join("") || "—"}</div></td>
+    <td><div class="chips">${Object.entries(r.refs).map(([c, v]) => chip(`${c}: ${v}`)).join("") || "—"}</div></td></tr>`).join("");
+}
+
+function render(s) {
+  $("clock").textContent = "🕒 " + s.now;
+  $("runs").innerHTML = renderRuns(s.runs);
+  $("phone").innerHTML = renderPhone(s.pushes, s.last_run);
+  $("gcal").innerHTML = renderGcal(s.gcal, s.last_run);
+  $("todo").innerHTML = renderTodo(s.todo, s.last_run);
+  $("records").innerHTML = renderRecords(s.records);
+  $("apple").innerHTML = renderApple(s.apple);
+  if (document.activeElement !== $("leads")) $("leads").value = s.leads;
+  const f = s.flags;
+  $("b-due").textContent = f.due_moved ? "↩ Move Assignment 1 back to 24 Oct" : "📅 Move Assignment 1 due date to 27 Oct";
+  $("b-add").textContent = f.added ? "↩ Unpublish Problem Set 5" : "➕ Publish a new assignment";
+  $("b-remove").textContent = f.removed ? "↩ Restore Assignment 1" : "🗑 Remove Assignment 1 from Canvas";
+  $("b-due").classList.toggle("on", f.due_moved);
+  $("b-add").classList.toggle("on", f.added);
+  $("b-remove").classList.toggle("on", f.removed);
+}
+
+document.querySelectorAll("button[data-action]").forEach((b) =>
+  b.addEventListener("click", async () => {
+    const res = await fetch(`/api/action/${b.dataset.action}`, { method: "POST" });
+    render(await res.json());
+  }));
+
+$("leads-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const res = await fetch("/api/leads", { method: "POST", body: JSON.stringify({ leads: $("leads").value }) });
+  if (!res.ok) { $("leads-msg").textContent = await res.text(); return; }
+  $("leads-msg").textContent = "";
+  render(await res.json());
+});
+
+fetch("/api/state").then((r) => r.json()).then(render);
+</script>
+</body>
+</html>

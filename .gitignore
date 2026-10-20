@@ -1,0 +1,36 @@
+# --- Secrets: never commit these ---
+.env
+.env.*
+!.env.example
+env.local.json
+deploy.env
+*.pem
+*.key
+credentials
+credentials.json
+client_secret*.json
+token*.json
+*.ics
+!tests/fixtures/*.ics
+
+# --- Build output ---
+.aws-sam/
+build/
+dist/
+*.egg-info/
+
+# --- Python tooling ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Editors / OS ---
+.DS_Store
+.idea/
+.vscode/

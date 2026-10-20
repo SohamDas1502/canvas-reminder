@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Help · Canvas Reminder</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="top"><a class="brand" href="/" style="color:inherit;text-decoration:none"><span class="brand-mark" aria-hidden="true">✓</span>Canvas Reminder</a></header>
+
+    <section class="card" id="canvas">
+      <h1>Help</h1>
+      <h2>Finding your Canvas calendar link</h2>
+      <ol class="howto">
+        <li>Sign in to Canvas in a web browser (not the app).</li>
+        <li>Open <strong>Calendar</strong> from the left-hand menu.</li>
+        <li>At the bottom right, click <strong>Calendar Feed</strong>.</li>
+        <li>Copy the whole link. It ends in <code>.ics</code>.</li>
+      </ol>
+    </section>
+
+    <section class="card" id="ntfy">
+      <h2>Phone notifications (ntfy)</h2>
+      <ol class="howto">
+        <li>Install the free <strong>ntfy</strong> app from the App Store or Google Play.</li>
+        <li>Tap <strong>+</strong>, paste the topic shown on your Canvas Reminder setup page, and tap <strong>Subscribe</strong>. Leave the server as <code>ntfy.sh</code>.</li>
+        <li>Allow notifications when your phone asks.</li>
+        <li>Back on Canvas Reminder, press <strong>Send a test</strong>.</li>
+      </ol>
+      <p class="small muted">Your topic is a long random name that only you know. Don't share it: anyone with it can see your reminders.</p>
+    </section>
+
+    <section class="card" id="apple">
+      <h2>Apple Reminders (iPhone Shortcut)</h2>
+      <p>Apple doesn't let websites add to Reminders directly, so a Shortcut on your iPhone fetches your upcoming assignments and adds them for you.</p>
+      <ol class="howto">
+        <li>On your dashboard, open <strong>Where you're reminded</strong>, tick <strong>Apple Reminders</strong>, and press <strong>Create my Shortcut token</strong>. Keep that page open.</li>
+        <li>In the <strong>Reminders</strong> app, create a list called <strong>Canvas</strong>.</li>
+        <li>In the <strong>Shortcuts</strong> app, tap <strong>+</strong> and name it <strong>Canvas Reminders</strong>.</li>
+        <li>Add <strong>Get Contents of URL</strong>. Paste the feed address from the setup page. Tap <em>Show More</em>, then under <em>Headers</em> add <strong>Authorization</strong> with the <code>Bearer …</code> value from the setup page.</li>
+        <li>Add <strong>Get Dictionary Value</strong>: get <em>Value</em> for <code>items</code>.</li>
+        <li>Add <strong>Repeat with Each</strong>. Inside it:
+          <ol>
+            <li><strong>Get Dictionary Value</strong> <code>tag</code> from <em>Repeat Item</em>, then <strong>Find Reminders</strong> where <em>Notes</em> contains it and <em>List</em> is <em>Canvas</em> (limit 1).</li>
+            <li><strong>If</strong> the <code>action</code> of the <em>Repeat Item</em> is <code>delete</code>: <strong>Remove Reminders</strong>.</li>
+            <li><strong>Otherwise, if</strong> a reminder was found: <strong>Edit Reminder</strong> to set its <em>Due Date</em> to <code>due</code> and <em>Alert</em> to <code>alert</code>.</li>
+            <li><strong>Otherwise</strong>: <strong>Add New Reminder</strong> with <code>title</code>, list <em>Canvas</em>, due date <code>due</code>, alert <code>alert</code> and notes <code>notes</code>.</li>
+          </ol>
+          Turn <code>due</code> and <code>alert</code> into dates with <strong>Get Dates from Input</strong>.
+        </li>
+        <li>In <strong>Automation</strong>, tap <strong>+</strong> → <strong>Time of Day</strong>, choose 8:00 am daily, <strong>Run Immediately</strong>, and pick <em>Canvas Reminders</em>. Add 1 pm and 6 pm too, so alerts move to your next reminder time promptly.</li>
+      </ol>
+      <p class="small muted">Action names differ slightly between iOS versions (older versions call "Edit Reminder" "Set … of Reminder").</p>
+    </section>
+
+    <section class="card" id="email">
+      <h2>Email reminders</h2>
+      <p>Nothing to set up. If the first email lands in spam, mark it as "not spam" so the rest arrive normally.</p>
+    </section>
+  </div>
+</body>
+</html>

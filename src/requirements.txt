@@ -1,0 +1,6 @@
+# Runtime dependencies, packaged into the Lambda by `sam build`.
+# boto3 is provided by the Lambda runtime.
+icalendar>=6.1,<8
+requests>=2.32,<3
+PyYAML>=6.0,<7
+tzdata>=2025.1

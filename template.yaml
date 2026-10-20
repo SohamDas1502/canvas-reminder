@@ -1,0 +1,406 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  canvas-reminder-pipeline - watches a Canvas calendar feed and sends assignment
+  reminders via ntfy, Google Calendar and Microsoft To Do.
+
+Parameters:
+  AlarmEmail:
+    Type: String
+    Description: Email address for error / dead-letter alarms (confirm the SNS email after deploy)
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  ScheduleExpression:
+    Type: String
+    Default: rate(30 minutes)
+    Description: How often to check the feed (EventBridge Scheduler expression)
+  SecretPrefix:
+    Type: String
+    Default: canvas-reminder
+    Description: Parameter Store path for secrets; parameters are /<prefix>/ics-url, /<prefix>/ntfy, ...
+  BudgetLimitUsd:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: Monthly AWS bill (USD, whole account) at which the kill switch pauses everything
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Resources:
+  # --- State --------------------------------------------------------------------------
+  AssignmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED  # 25 RCU/WCU are always free; this uses 2 of each
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+      AttributeDefinitions:
+        - AttributeName: uid
+          AttributeType: S
+      KeySchema:
+        - AttributeName: uid
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: false  # false = AWS-owned key (free); data is still encrypted at rest
+
+  # --- Failure handling ---------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      SqsManagedSseEnabled: true
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  # --- Function -----------------------------------------------------------------------
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-reminder
+      RetentionInDays: 14
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: OwnLogsOnly
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt FunctionLogGroup.Arn
+              - Sid: OwnTableOnly
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Scan]
+                Resource: !GetAtt AssignmentsTable.Arn
+              # SecureString parameters use the AWS-managed aws/ssm key, whose key policy
+              # already lets this account decrypt through SSM: no KMS statement needed.
+              - Sid: ReadOwnSecretsOnly
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SecretPrefix}/*
+              - Sid: PersistRotatedMicrosoftRefreshToken
+                Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SecretPrefix}/microsoft
+              - Sid: AsyncFailuresToDlq
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  ReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-reminder
+      CodeUri: src/
+      Handler: canvas_reminder.handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]  # cheaper per GB-second than x86
+      MemorySize: 256
+      Timeout: 120
+      Role: !GetAtt FunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AssignmentsTable
+          SECRET_PREFIX: !Ref SecretPrefix
+          LOG_LEVEL: !Ref LogLevel
+      # Async invocations (from the scheduler) retry twice, then land in the DLQ.
+      # Retries are safe: every side effect is guarded by a DynamoDB claim or lease.
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 1200
+
+  # --- Apple Reminders feed (polled by an iPhone Shortcut) -----------------------------
+  # Read-only: it can scan the table and read one secret, nothing else. Returns 404
+  # unless "apple" is in config.yaml channels, and 401 without the bearer token.
+  AppleFeedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-apple-feed
+      RetentionInDays: 14
+
+  AppleFeedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-only-feed
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt AppleFeedLogGroup.Arn
+              - Effect: Allow
+                Action: dynamodb:Scan
+                Resource: !GetAtt AssignmentsTable.Arn
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SecretPrefix}/apple
+
+  AppleFeedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-apple-feed
+      CodeUri: src/
+      Handler: canvas_reminder.apple.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 15
+      Role: !GetAtt AppleFeedRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref AppleFeedLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AssignmentsTable
+          SECRET_PREFIX: !Ref SecretPrefix
+          LOG_LEVEL: !Ref LogLevel
+      FunctionUrlConfig:
+        AuthType: NONE  # the Shortcut can't sign AWS requests; the bearer token is checked in code
+
+  # --- Schedule -----------------------------------------------------------------------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-and-dead-letter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ReminderFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Check the Canvas feed for new or changed assignments
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: Australia/Melbourne
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt ReminderFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"source": "canvas-reminder.schedule"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 900
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+
+  # --- Budget kill switch -------------------------------------------------------------
+  # At 80% of the budget: email. At 100%: email + SNS -> KillSwitchFunction, which disables
+  # the schedule and blocks both functions.
+  BudgetTopic:
+    Type: AWS::SNS::Topic
+
+  BudgetTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref BudgetTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: budgets.amazonaws.com }
+            Action: SNS:Publish
+            Resource: !Ref BudgetTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    DependsOn: BudgetTopicPolicy  # Budgets checks it may publish before creating
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref BudgetLimitUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlarmEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlarmEmail
+            - SubscriptionType: SNS
+              Address: !Ref BudgetTopic
+
+  KillSwitchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-kill-switch
+      RetentionInDays: 90
+
+  KillSwitchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pause-only-this-app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt KillSwitchLogGroup.Arn
+              - Sid: DisableOwnSchedule
+                Effect: Allow
+                Action: [scheduler:GetSchedule, scheduler:UpdateSchedule]
+                Resource: !GetAtt Schedule.Arn
+              - Sid: UpdateScheduleRequiresPassingItsRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SchedulerRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: scheduler.amazonaws.com
+              - Sid: BlockOwnFunctions
+                Effect: Allow
+                Action: lambda:PutFunctionConcurrency
+                Resource: [!GetAtt ReminderFunction.Arn, !GetAtt AppleFeedFunction.Arn]
+              - Sid: FinalPhonePush
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SecretPrefix}/ntfy
+
+  KillSwitchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-kill-switch
+      CodeUri: src/
+      Handler: canvas_reminder.killswitch.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt KillSwitchRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref KillSwitchLogGroup
+      Environment:
+        Variables:
+          SCHEDULE_NAME: !Ref Schedule
+          FUNCTION_NAMES: !Sub ${ReminderFunction},${AppleFeedFunction}
+          SECRET_PREFIX: !Ref SecretPrefix
+          LOG_LEVEL: !Ref LogLevel
+      Events:
+        BudgetExceeded:
+          Type: SNS
+          Properties:
+            Topic: !Ref BudgetTopic
+
+  # --- Alarms -------------------------------------------------------------------------
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: canvas-reminder Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReminderFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Invocations failed after all retries and are in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  FunctionName:
+    Value: !Ref ReminderFunction
+  TableName:
+    Value: !Ref AssignmentsTable
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  ScheduleName:
+    Value: !Ref Schedule
+  AppleFeedFunctionName:
+    Value: !Ref AppleFeedFunction
+  KillSwitchFunctionName:
+    Value: !Ref KillSwitchFunction
+  AppleRemindersFeedUrl:
+    Description: URL for the iPhone Shortcut (send an Authorization Bearer token header)
+    Value: !GetAtt AppleFeedFunctionUrl.FunctionUrl

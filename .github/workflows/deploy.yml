@@ -1,0 +1,38 @@
+name: Deploy
+
+# Manual only. The "production" environment should have "Required reviewers" set
+# (repo Settings -> Environments), so every deploy waits for your approval.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # OIDC: no long-lived AWS keys stored in GitHub
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt && pytest -q
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-southeast-2
+      - run: sam build
+      - run: >-
+          sam deploy
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
+          --parameter-overrides AlarmEmail=${{ vars.ALARM_EMAIL }}

@@ -1,0 +1,21 @@
+# No secrets or personal details here: email addresses come from the git-ignored
+# deploy.env (see deploy.env.example) via the Makefile.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "canvas-reminder-pipeline"
+region = "ap-southeast-2"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "canvas-reminder-pipeline"
+image_repositories = []

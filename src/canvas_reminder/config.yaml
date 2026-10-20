@@ -1,0 +1,24 @@
+# canvas-reminder-pipeline configuration (written by `make configure`).
+# No secrets here: those live in SSM Parameter Store. Takes effect on the next deploy.
+
+# Where reminders go: ntfy, gcal (Google Calendar), mstodo (Microsoft To Do),
+# apple (Apple Reminders, via an iPhone Shortcut). Each needs its secret (see README).
+channels: [ntfy, apple]  # add gcal, mstodo after their OAuth setup (README steps 3-4)
+
+# How long before the due date to remind you, in every channel (m, h, d; up to 5).
+# To Do and Apple Reminders allow one alert per item, so their alert moves to the
+# next of these times as each one passes.
+lead_times: [2d]
+
+# Per-course times. Keys match the start of the Canvas course code.
+course_overrides: {}
+
+# Courses to skip entirely (same prefix matching).
+ignore_courses: []
+
+# When an assignment disappears from Canvas before it's due: notify | delete | ignore
+on_removed: delete
+
+ntfy_server: https://ntfy.sh
+google_calendar_id: primary
+todo_list_name: Canvas

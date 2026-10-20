@@ -1,0 +1,22 @@
+title = "canvas-reminder-pipeline"
+
+[extend]
+useDefault = true
+
+# A Canvas calendar feed URL is a bearer credential: anyone with it can read your calendar.
+[[rules]]
+id = "canvas-calendar-feed"
+description = "Canvas private calendar feed URL"
+regex = '''feeds/calendars/user_[A-Za-z0-9]{20,}'''
+keywords = ["feeds/calendars/user_"]
+
+[[rules]]
+id = "ntfy-access-token"
+description = "ntfy access token"
+regex = '''tk_[a-z0-9]{29}'''
+keywords = ["tk_"]
+
+# The obviously fake token used in tests.
+[allowlist]
+description = "Test fixtures"
+regexes = ['''user_FAKEtoken[0-9a-z]*''']

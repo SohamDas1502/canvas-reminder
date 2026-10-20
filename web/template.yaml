@@ -1,0 +1,483 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  canvas-reminder-web - multi-user Canvas reminders: sign-in, per-user encrypted
+  settings, an HTTP API, and scheduled per-user workers. Shares its reminder engine
+  with the single-user stack in ../template.yaml.
+
+Parameters:
+  AlarmEmail:
+    Type: String
+    Description: Where operational alarms go (you, the operator)
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  FromEmail:
+    Type: String
+    Description: Sender address for reminder emails (verified in SES on first deploy)
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: "http://localhost:8000"
+    Description: Browser origins allowed to call the API
+  NtfyServer:
+    Type: String
+    Default: https://ntfy.sh
+  ScheduleExpression:
+    Type: String
+    Default: rate(30 minutes)
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 256
+    CodeUri: ../src/
+    Environment:
+      Variables:
+        USERS_TABLE: !Ref UsersTable
+        ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+        FEED_PARAMETER_PATH: !Sub /${AWS::StackName}/feeds
+        FROM_EMAIL: !Ref FromEmail
+        APP_URL_PARAMETER: !Sub /${AWS::StackName}/app-url
+        NTFY_SERVER: !Ref NtfyServer
+        LOG_LEVEL: !Ref LogLevel
+
+Resources:
+  # --- Data ---------------------------------------------------------------------------
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED  # within the always-free 25 RCU/WCU
+      ProvisionedThroughput: { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }
+      AttributeDefinitions:
+        - { AttributeName: user_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: user_id, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
+  AssignmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 10, WriteCapacityUnits: 10 }
+      AttributeDefinitions:
+        - { AttributeName: user, AttributeType: S }
+        - { AttributeName: uid, AttributeType: S }
+      KeySchema:
+        - { AttributeName: user, KeyType: HASH }
+        - { AttributeName: uid, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # --- Sign-in: email + one-time code, no passwords -----------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UserPoolTier: ESSENTIALS  # needed for email one-time codes; free up to 10,000 MAU
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        SignInPolicy:
+          AllowedFirstAuthFactors: [PASSWORD, EMAIL_OTP]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      Schema:
+        - { Name: email, AttributeDataType: String, Required: true, Mutable: true }
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { IdToken: minutes, AccessToken: minutes, RefreshToken: days }
+
+  # --- Email sending --------------------------------------------------------------------
+  # SES sends you a verification email for this address on first deploy. New SES
+  # accounts are in the sandbox (can only email verified addresses) until you request
+  # production access; see web/README.md.
+  SenderIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref FromEmail
+
+  # --- Work queue -----------------------------------------------------------------------
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 360  # 6x the worker timeout, as Lambda recommends
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WorkDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  WorkDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # --- Functions (each with its own least-privilege role) -------------------------------
+  DispatcherLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-dispatcher
+      RetentionInDays: 14
+
+  DispatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: list-users-and-enqueue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt DispatcherLogs.Arn
+              - Effect: Allow
+                Action: dynamodb:Scan
+                Resource: !GetAtt UsersTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt WorkQueue.Arn
+
+  DispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-dispatcher
+      Handler: canvas_reminder.web.worker.dispatch_handler
+      Timeout: 60
+      Role: !GetAtt DispatcherRole.Arn
+      LoggingConfig: { LogGroup: !Ref DispatcherLogs }
+      Environment:
+        Variables:
+          WORK_QUEUE_URL: !Ref WorkQueue
+      Events:
+        EveryHalfHour:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref ScheduleExpression
+            ScheduleExpressionTimezone: Australia/Melbourne
+            RetryPolicy: { MaximumRetryAttempts: 2 }
+
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-worker
+      RetentionInDays: 14
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: run-one-user
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt WorkerLogs.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt UsersTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource: !GetAtt AssignmentsTable.Arn
+              # Feed links are SecureString parameters under the aws/ssm managed key,
+              # whose key policy already allows decryption through SSM in this account.
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/app-url
+              - Sid: ReadFeedLinks
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/feeds/*
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt WorkQueue.Arn
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-worker
+      Handler: canvas_reminder.web.worker.worker_handler
+      Timeout: 60
+      Role: !GetAtt WorkerRole.Arn
+      LoggingConfig: { LogGroup: !Ref WorkerLogs }
+      Events:
+        Work:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WorkQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 5  # caps load on DynamoDB, ntfy and SES
+
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-api
+      RetentionInDays: 14
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: signed-in-user-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ApiLogs.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !GetAtt UsersTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:BatchWriteItem]
+                Resource: !GetAtt AssignmentsTable.Arn
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/app-url
+              - Sid: StoreAndDeleteFeedLinks
+                Effect: Allow
+                Action: [ssm:PutParameter, ssm:DeleteParameter]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/feeds/*
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+              - Sid: DeleteMyAccount
+                Effect: Allow
+                Action: cognito-idp:AdminDeleteUser
+                Resource: !GetAtt UserPool.Arn
+
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowMethods: [GET, PUT, POST, DELETE]
+        AllowHeaders: [authorization, content-type]
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: Cognito
+        Authorizers:
+          Cognito:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: [!Ref UserPoolClient]
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-api
+      Handler: canvas_reminder.web.api.lambda_handler
+      Timeout: 29
+      Role: !GetAtt ApiRole.Arn
+      LoggingConfig: { LogGroup: !Ref ApiLogs }
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+      Events:
+        GetMe: { Type: HttpApi, Properties: { ApiId: !Ref Api, Path: /api/me, Method: GET } }
+        DeleteMe: { Type: HttpApi, Properties: { ApiId: !Ref Api, Path: /api/me, Method: DELETE } }
+        PutFeed: { Type: HttpApi, Properties: { ApiId: !Ref Api, Path: /api/me/feed, Method: PUT } }
+        PutPreferences: { Type: HttpApi, Properties: { ApiId: !Ref Api, Path: /api/me/preferences, Method: PUT } }
+        SendTest: { Type: HttpApi, Properties: { ApiId: !Ref Api, Path: /api/me/test, Method: POST } }
+        NewAppleToken: { Type: HttpApi, Properties: { ApiId: !Ref Api, Path: /api/me/apple-token, Method: POST } }
+        ListAssignments: { Type: HttpApi, Properties: { ApiId: !Ref Api, Path: /api/me/assignments, Method: GET } }
+        AppleFeed:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /api/apple/feed
+            Method: GET
+            Auth: { Authorizer: NONE }  # checks its own per-user token
+
+  # --- Website: private S3 bucket behind CloudFront; /api/* goes to the HTTP API ---------
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OnlyThisCloudFrontDistribution
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-site
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub ${AWS::StackName}-security-headers
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub >-
+              default-src 'self';
+              script-src 'self';
+              style-src 'self' https://fonts.googleapis.com;
+              font-src https://fonts.gstatic.com;
+              img-src 'self' data:;
+              connect-src 'self' https://cognito-idp.${AWS::Region}.amazonaws.com;
+              frame-ancestors 'none'; base-uri 'none'; form-action 'self'
+          StrictTransportSecurity: { Override: true, AccessControlMaxAgeSec: 63072000, IncludeSubdomains: true }
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { Override: true, FrameOption: DENY }
+          ReferrerPolicy: { Override: true, ReferrerPolicy: no-referrer }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${AWS::StackName} website
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_All
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: api
+            DomainName: !Sub ${Api}.execute-api.${AWS::Region}.amazonaws.com
+            CustomOriginConfig: { OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2] }
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+            ResponseHeadersPolicyId: !Ref SecurityHeaders
+
+  # The site's public address, for links in reminder emails. A parameter (not an env
+  # var) because the functions can't reference the distribution without a cycle.
+  AppUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/app-url
+      Type: String
+      Value: !Sub https://${Distribution.DomainName}
+
+  # --- Alarms (to you, the operator) ----------------------------------------------------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref AlarmEmail }
+
+  WorkDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A user's scheduled run failed 3 times and is in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt WorkDeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The web API returned unhandled errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  SiteUrl:
+    Value: !Sub https://${Distribution.DomainName}
+  SiteBucket:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  Region:
+    Value: !Ref AWS::Region

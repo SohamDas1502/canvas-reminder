@@ -1,0 +1,8 @@
+# Optional: local DynamoDB for `make local-real` and `make invoke`.
+services:
+  localstack:
+    image: localstack/localstack:4.4
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      SERVICES: dynamodb
